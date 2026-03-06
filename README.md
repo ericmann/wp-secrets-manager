@@ -38,7 +38,7 @@ For dedicated key management, add to `wp-config.php`:
 
 ```php
 // Generate with: wp secret generate-key
-define( 'WP_SECRETS_KEY', 'base64:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX=' );
+define( 'WP_SECRETS_KEY', 'your-generated-key-here' );
 ```
 
 If you want to use an environment variable, wrap it yourself:

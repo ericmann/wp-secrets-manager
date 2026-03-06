@@ -575,8 +575,7 @@ class WP_Secrets_CLI extends WP_CLI_Command {
 
 		try {
 			$key       = random_bytes( SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
-			// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
-			$key_value = 'base64:' . base64_encode( $key );
+			$key_value = bin2hex( $key );
 		} catch ( \Exception $e ) {
 			WP_CLI::error( 'Failed to generate random key: ' . $e->getMessage() );
 		}

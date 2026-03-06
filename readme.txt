@@ -27,7 +27,7 @@ That's it. Encryption and key management are handled automatically.
 
 Just activate. Secrets are encrypted immediately using keys derived from your existing WordPress salts. For better key management, add a dedicated key to `wp-config.php`:
 
-`define( 'WP_SECRETS_KEY', 'base64:XXXXXXXXXXXXXXXX...' );`
+`define( 'WP_SECRETS_KEY', 'your-secret-key-here' );`
 
 Generate one with `wp secret generate-key`.
 
@@ -61,7 +61,7 @@ Generate one with `wp secret generate-key`.
 2. Activate the plugin through the 'Plugins' menu in WordPress.
 3. (Optional) Add a dedicated encryption key to `wp-config.php`:
 
-`define( 'WP_SECRETS_KEY', 'base64:...' );`
+`define( 'WP_SECRETS_KEY', '...' );`
 
 Generate one with: `wp secret generate-key`
 

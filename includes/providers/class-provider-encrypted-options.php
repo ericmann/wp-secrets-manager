@@ -474,24 +474,15 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 	}
 
 	/**
-	 * Derive a 32-byte key from arbitrary key material.
+	 * Derive a 32-byte key from arbitrary key material using BLAKE2b.
 	 *
-	 * If the material is a base64:-prefixed string of exactly the right
-	 * length, it is used directly. Otherwise, BLAKE2b hashes it to the
-	 * correct length.
+	 * Any string of any length is accepted. The material is always hashed
+	 * to produce a fixed-length key suitable for sodium_crypto_secretbox.
 	 *
 	 * @param string $material Raw key material.
 	 * @return string 32-byte binary key.
 	 */
 	private function derive_key_from_material( string $material ): string {
-		if ( 0 === strpos( $material, 'base64:' ) ) {
-			// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode
-			$decoded = base64_decode( substr( $material, 7 ), true );
-			if ( false !== $decoded && SODIUM_CRYPTO_SECRETBOX_KEYBYTES === strlen( $decoded ) ) {
-				return $decoded;
-			}
-		}
-
 		return sodium_crypto_generichash( $material, '', SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
 	}
 

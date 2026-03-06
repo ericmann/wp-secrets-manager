@@ -22,14 +22,14 @@ jobs:
 
     services:
       mysql:
-        image: mysql:5.7
+        image: mariadb:10.11
         env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: wordpress_tests
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: wordpress_tests
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping --silent"
+          --health-cmd="mysqladmin ping -h 127.0.0.1 --silent"
           --health-interval=10s
           --health-timeout=5s
           --health-retries=5
@@ -37,6 +37,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y subversion
 
       - name: Set up PHP ${{ matrix.php }}
         uses: shivammathur/setup-php@v2
