@@ -3,6 +3,9 @@
 	bootstrap="tests/bootstrap.php"
 	backupGlobals="false"
 	colors="true"
+	convertErrorsToExceptions="true"
+	convertNoticesToExceptions="true"
+	convertWarningsToExceptions="true"
 	beStrictAboutTestsThatDoNotTestAnything="true"
 >
 	<testsuites>
@@ -10,4 +13,12 @@
 			<directory prefix="test-" suffix=".php">./tests/phpunit/</directory>
 		</testsuite>
 	</testsuites>
+
+	<filter>
+		<whitelist>
+			<directory suffix=".php">./includes</directory>
+			<directory suffix=".php">./cli</directory>
+			<file>./wp-secrets-manager.php</file>
+		</whitelist>
+	</filter>
 </phpunit>

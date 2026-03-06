@@ -111,9 +111,7 @@ jobs:
         run: npm run composer install
 
       - name: Run tests with coverage
-        run: |
-          npm run env run tests-cli --env-cwd=wp-content/plugins/wp-secrets-manager -- \
-            vendor/bin/phpunit --coverage-clover=coverage/clover.xml --coverage-text
+        run: npm run composer coverage
 
       - name: Copy coverage from container
         if: always()
@@ -122,11 +120,12 @@ jobs:
             ./clover.xml 2>/dev/null || echo "No coverage file found"
 
       - name: Upload coverage artifact
-        if: hashFiles('clover.xml') != ''
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: clover.xml
+          if-no-files-found: ignore
           retention-days: 30
 
   coding-standards:
