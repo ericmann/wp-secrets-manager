@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Secrets Manager
  * Plugin URI:  https://github.com/DisplaceFoundry/wp-secrets-manager
- * Description: A standardized secrets management API for WordPress. Provides get_secret() and set_secret() with pluggable backends including encrypted options, AWS KMS, HashiCorp Vault, and more.
+ * Description: A standardized secrets management API for WordPress. Provides get_secret() and set_secret() with automatic encryption and a pluggable provider interface for external backends.
  * Version:     0.1.0
  * Author:      Displace Foundry
  * Author URI:  https://displacefoundry.com
@@ -30,7 +30,6 @@ require_once WP_SECRETS_MANAGER_DIR . 'includes/class-wp-secrets-context.php';
 require_once WP_SECRETS_MANAGER_DIR . 'includes/class-wp-secrets-audit.php';
 require_once WP_SECRETS_MANAGER_DIR . 'includes/class-wp-secrets-manager.php';
 require_once WP_SECRETS_MANAGER_DIR . 'includes/class-wp-secrets.php';
-require_once WP_SECRETS_MANAGER_DIR . 'includes/providers/class-provider-options.php';
 require_once WP_SECRETS_MANAGER_DIR . 'includes/providers/class-provider-encrypted-options.php';
 require_once WP_SECRETS_MANAGER_DIR . 'includes/admin/class-admin-page.php';
 require_once WP_SECRETS_MANAGER_DIR . 'includes/admin/class-health-check.php';
@@ -96,7 +95,6 @@ function wp_secrets_register_provider( WP_Secrets_Provider $provider ): bool {
  */
 function wp_secrets_manager_init() {
 	$manager = WP_Secrets_Manager::get_instance();
-	$manager->register_provider( new Provider_Options() );
 	$manager->register_provider( new Provider_Encrypted_Options() );
 
 	/**

@@ -1,12 +1,12 @@
 # WP Secrets Manager
 
-A standardized secrets management API for WordPress. Provides `get_secret()` and `set_secret()` — the missing secrets API that WordPress has always needed.
+A standardized secrets management API for WordPress. Provides `get_secret()` and `set_secret()` — the missing secrets API that WordPress has always needed. All secrets are encrypted at rest. Always.
 
 ## The Problem
 
 Every WordPress plugin that connects to an external service stores API keys, tokens, and credentials in the `wp_options` table — in plaintext. There is no standard API for secrets management. Google Site Kit, WooCommerce, Mailchimp, Yoast, and hundreds of other plugins each reinvent their own (usually insecure) approach.
 
-**WP Secrets Manager** solves this by providing a single, extensible API with pluggable backends.
+**WP Secrets Manager** solves this by providing a single, extensible API where encryption is the only option.
 
 ## Quick Start
 
@@ -32,76 +32,69 @@ That's it. Encryption, key management, and backend selection are handled automat
 
 ### For Site Operators
 
-Just activate the plugin. If `LOGGED_IN_KEY` and `LOGGED_IN_SALT` are defined in your `wp-config.php` (they should be — WordPress requires them), secrets are encrypted automatically with no additional configuration.
+Just activate the plugin. Secrets are encrypted immediately using keys derived from your existing WordPress salts — no configuration required.
 
-For best security, add a dedicated encryption key:
+For dedicated key management, add to `wp-config.php`:
 
 ```php
 // Generate with: wp secret generate-key
 define( 'WP_SECRETS_KEY', 'base64:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX=' );
 ```
 
+If you want to use an environment variable, wrap it yourself:
+
+```php
+define( 'WP_SECRETS_KEY', getenv( 'MY_SECRETS_KEY' ) );
+```
+
 ## How It Works
+
+### Architecture
 
 WP Secrets Manager uses a three-layer architecture:
 
-1. **Consumer Layer** — Global functions (`get_secret()`, `set_secret()`) and WP-CLI commands that plugins and operators interact with.
+1. **Consumer Layer** — Global functions (`get_secret()`, `set_secret()`) and WP-CLI commands.
 2. **SDK / Public API** — The `WP_Secrets` class that enforces access control, validates keys, fires audit hooks, and delegates to the active provider.
-3. **Provider Layer** — Pluggable backends that actually store secrets. Ships with two built-in providers; supports unlimited third-party backends.
+3. **Provider Layer** — Pluggable backends that store secrets. Ships with one built-in encrypted provider; supports third-party backends via the provider interface.
+
+### Master Key Architecture
+
+Secrets use a two-tier encryption scheme:
+
+1. A **secrets key** (derived from `WP_SECRETS_KEY` or `LOGGED_IN_KEY . LOGGED_IN_SALT`) encrypts the master key.
+2. A randomly-generated **master key** (stored encrypted in `wp_options`) encrypts individual secrets.
+
+This means key rotation (`wp secret rotate`) only re-encrypts the single master key — not every stored secret.
+
+### Key Derivation
+
+The secrets key is derived from one of two sources:
+
+| Priority | Source | How |
+|----------|--------|-----|
+| 1 | `WP_SECRETS_KEY` constant | Defined in `wp-config.php` (recommended) |
+| 2 | WordPress salts | `LOGGED_IN_KEY . LOGGED_IN_SALT` (always available) |
+
+There is no plaintext fallback. Encryption is always active.
 
 ### Automatic Provider Selection
 
-The plugin makes smart decisions so you don't have to:
-
-| Priority | Provider | When Selected |
-|----------|----------|--------------|
-| 80+ | Third-party (AWS KMS, Vault, etc.) | When registered and available |
-| 50 | **Encrypted Options** | When sodium + encryption key available (default on most hosts) |
-| 10 | Plaintext Options | Always available — last resort fallback |
-
-The highest-priority available provider wins. No configuration needed. Power users can force a specific provider:
+The plugin ships with one built-in provider (encrypted options) and supports unlimited third-party providers. The highest-priority available provider is selected automatically. Power users can force a specific provider:
 
 ```php
-define( 'WP_SECRETS_PROVIDER', 'encrypted-options' );
+define( 'WP_SECRETS_PROVIDER', 'aws-kms' );
 ```
 
-## Built-in Providers
+## Key Rotation
 
-### Encrypted Options (Recommended)
+WP Secrets Manager supports seamless key rotation via `WP_SECRETS_KEY_PREVIOUS`:
 
-Encrypts secrets with `sodium_crypto_secretbox` (XSalsa20-Poly1305) before storing in `wp_options`. Each write uses a unique nonce. The encryption key is resolved automatically:
+1. Set `WP_SECRETS_KEY_PREVIOUS` to your current key.
+2. Set `WP_SECRETS_KEY` to your new key.
+3. Run `wp secret rotate`.
+4. Remove `WP_SECRETS_KEY_PREVIOUS` once done.
 
-1. `WP_SECRETS_KEY` constant in `wp-config.php` (best)
-2. `WP_SECRETS_KEY` environment variable (good for containers)
-3. `LOGGED_IN_KEY . LOGGED_IN_SALT` fallback (functional, ships with WordPress)
-
-### Plaintext Options (Fallback)
-
-Stores secrets in `wp_options` with a `_wp_secret_` prefix. Exists solely for zero-configuration environments. Site Health will recommend upgrading when this provider is active.
-
-## Encryption Setup
-
-### Option 1: Dedicated Key (Recommended)
-
-```bash
-# Generate a key
-wp secret generate-key
-
-# Output:
-# define( 'WP_SECRETS_KEY', 'base64:abc123...=' );
-#
-# Add the line above to your wp-config.php file.
-```
-
-### Option 2: Environment Variable
-
-```bash
-export WP_SECRETS_KEY="base64:abc123...="
-```
-
-### Option 3: Automatic Fallback
-
-If neither of the above is configured, the plugin derives a key from `LOGGED_IN_KEY . LOGGED_IN_SALT`. This works out of the box but is slightly less ideal because these WordPress salts can theoretically be rotated.
+Because of the master key architecture, only the master key is re-encrypted — individual secrets are untouched. The provider also auto-heals: if it fails to decrypt the master key with the current key but succeeds with the previous key, it transparently re-encrypts the master key.
 
 ## Key Namespacing
 
@@ -144,11 +137,10 @@ wp secret delete my-plugin/api_key
 # Show provider info
 wp secret provider
 
-# Migrate between providers
-wp secret migrate --from=options --to=encrypted-options
-wp secret migrate --from=encrypted-options --to=aws-kms --delete-source
+# Migrate to a different provider
+wp secret migrate --from=encrypted-options --to=aws-kms
 
-# Re-encrypt after key rotation
+# Re-encrypt master key after key rotation
 wp secret rotate
 
 # Export keys for documentation/audit
@@ -170,7 +162,6 @@ Customize access with the `wp_secrets_access` filter:
 
 ```php
 add_filter( 'wp_secrets_access', function( bool $allowed, string $key, string $operation, array $context ): bool {
-    // Allow a monitoring plugin to check existence of any secret
     if ( $context['plugin'] === 'my-monitor' && $operation === 'exists' ) {
         return true;
     }
@@ -196,6 +187,7 @@ add_filter( 'wp_secrets_access', function( bool $allowed, string $key, string $o
 | `wp_secrets_post_set` | `$key, $context` | After successful storage |
 | `wp_secrets_post_delete` | `$key, $result, $context` | After deletion attempt |
 | `wp_secrets_access_denied` | `$key, $operation, $context` | When access is denied |
+| `wp_secrets_master_key_rotated` | `$key_source` | When the master key is re-encrypted after rotation |
 | `wp_secrets_admin_page_before` | `$providers, $active_id` | Before admin page render |
 | `wp_secrets_admin_page_after` | `$providers, $active_id` | After admin page render |
 
@@ -246,8 +238,6 @@ class My_KMS_Provider implements WP_Secrets_Provider {
 }
 ```
 
-Use priorities above 50 for remote backends (they're inherently more secure than local encryption) and above 80 for production-grade solutions.
-
 ## Adopting WP Secrets Manager in Your Plugin
 
 Support both secrets-managed and traditional sites:
@@ -277,13 +267,11 @@ function my_plugin_set_api_key( string $value ): void {
 
 WP Secrets Manager adds checks to Tools > Site Health:
 
-- **Critical** — No encryption key available when encrypted provider is active
-- **Recommended** — Using plaintext provider; suggests enabling encryption
-- **Recommended** — Using fallback key instead of dedicated `WP_SECRETS_KEY`
+- **Recommended** — Using key derived from WordPress salts; suggests defining `WP_SECRETS_KEY`
 - **Good** — Encrypted provider active with dedicated key
-- **Good** — Remote provider active and healthy
+- **Good** — Third-party provider active and healthy
 
-Debug information is available in the Site Health Info tab.
+Debug information (key source, master key status, provider details) is available in the Site Health Info tab.
 
 ## Security Considerations
 
@@ -298,7 +286,7 @@ Debug information is available in the Site Health Info tab.
 
 ## Requirements
 
-- PHP 7.4+ (sodium extension required for encryption; ships with PHP 7.2+)
+- PHP 7.4+ (sodium extension required; ships with PHP 7.2+)
 - WordPress 6.4+ (for `Requires Plugins` header support)
 - WP-CLI 2.8+ (for CLI commands)
 

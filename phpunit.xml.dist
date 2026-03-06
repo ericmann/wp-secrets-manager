@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<phpunit
+	bootstrap="tests/bootstrap.php"
+	backupGlobals="false"
+	colors="true"
+	convertErrorsToExceptions="true"
+	convertNoticesToExceptions="true"
+	convertWarningsToExceptions="true"
+>
+	<testsuites>
+		<testsuite name="WP Secrets Manager">
+			<directory prefix="test-" suffix=".php">./tests/phpunit/</directory>
+		</testsuite>
+	</testsuites>
+
+	<groups>
+		<include>
+			<group>provider-contract</group>
+			<group>encrypted</group>
+			<group>api</group>
+			<group>access-control</group>
+			<group>audit</group>
+			<group>cli</group>
+		</include>
+	</groups>
+
+	<filter>
+		<whitelist>
+			<directory suffix=".php">./includes</directory>
+			<directory suffix=".php">./cli</directory>
+			<file>./wp-secrets-manager.php</file>
+		</whitelist>
+	</filter>
+</phpunit>

@@ -2,7 +2,7 @@
 /**
  * WP Secrets Site Health Integration
  *
- * Adds checks to WordPress Site Health (Tools → Site Health) to report
+ * Adds checks to WordPress Site Health (Tools > Site Health) to report
  * on the security posture of the secrets storage system.
  *
  * @package WP_Secrets_Manager
@@ -64,7 +64,7 @@ class WP_Secrets_Health_Check {
 				),
 				'description' => sprintf(
 					'<p>%s</p>',
-					__( 'WP Secrets Manager has no active provider. Secrets cannot be stored or retrieved.', 'wp-secrets-manager' )
+					__( 'WP Secrets Manager has no active provider. Secrets cannot be stored or retrieved. The sodium PHP extension may not be available.', 'wp-secrets-manager' )
 				),
 				'actions'     => '',
 				'test'        => 'wp_secrets_provider',
@@ -73,12 +73,6 @@ class WP_Secrets_Health_Check {
 
 		$health = $provider->health_check();
 		$status = $health['status'];
-
-		$status_map = array(
-			'good'        => 'good',
-			'recommended' => 'recommended',
-			'critical'    => 'critical',
-		);
 
 		$color_map = array(
 			'good'        => 'blue',
@@ -106,7 +100,7 @@ class WP_Secrets_Health_Check {
 
 		return array(
 			'label'       => $label_map[ $status ] ?? $label_map['critical'],
-			'status'      => $status_map[ $status ] ?? 'critical',
+			'status'      => $status,
 			'badge'       => array(
 				'label' => __( 'Security', 'wp-secrets-manager' ),
 				'color' => $color_map[ $status ] ?? 'red',
@@ -118,7 +112,7 @@ class WP_Secrets_Health_Check {
 	}
 
 	/**
-	 * Test: Encryption availability.
+	 * Test: Encryption key configuration.
 	 *
 	 * @return array Site Health test result.
 	 */
@@ -126,66 +120,9 @@ class WP_Secrets_Health_Check {
 		$manager  = WP_Secrets_Manager::get_instance();
 		$provider = $manager->get_active_provider();
 
-		if ( $provider && 'options' === $provider->get_id() ) {
-			$encrypted = $manager->get_provider( 'encrypted-options' );
-			$reason    = '';
-
-			if ( $encrypted && ! $encrypted->is_available() ) {
-				if ( ! function_exists( 'sodium_crypto_secretbox' ) ) {
-					$reason = __( 'The sodium PHP extension is not available.', 'wp-secrets-manager' );
-				} else {
-					$reason = __( 'No encryption key is available. Define WP_SECRETS_KEY in wp-config.php.', 'wp-secrets-manager' );
-				}
-			}
-
+		if ( ! $provider instanceof Provider_Encrypted_Options ) {
 			return array(
-				'label'       => __( 'Secrets are stored without encryption', 'wp-secrets-manager' ),
-				'status'      => 'recommended',
-				'badge'       => array(
-					'label' => __( 'Security', 'wp-secrets-manager' ),
-					'color' => 'orange',
-				),
-				'description' => sprintf(
-					'<p>%s</p>%s',
-					__( 'Secrets are currently stored as plaintext in the database. If an attacker gains database access, all secrets will be exposed.', 'wp-secrets-manager' ),
-					$reason ? sprintf( '<p>%s</p>', esc_html( $reason ) ) : ''
-				),
-				'actions'     => sprintf(
-					'<p><a href="%s">%s</a></p>',
-					esc_url( 'https://github.com/DisplaceFoundry/wp-secrets-manager#encryption-setup' ),
-					__( 'Learn how to enable encryption', 'wp-secrets-manager' )
-				),
-				'test'        => 'wp_secrets_encryption',
-			);
-		}
-
-		if ( $provider && 'encrypted-options' === $provider->get_id() ) {
-			$encrypted_provider = $manager->get_provider( 'encrypted-options' );
-			$key_source         = 'unknown';
-
-			if ( $encrypted_provider instanceof Provider_Encrypted_Options ) {
-				$key_source = $encrypted_provider->get_key_source();
-			}
-
-			if ( Provider_Encrypted_Options::KEY_SOURCE_FALLBACK === $key_source ) {
-				return array(
-					'label'       => __( 'Secrets encrypted with fallback key', 'wp-secrets-manager' ),
-					'status'      => 'recommended',
-					'badge'       => array(
-						'label' => __( 'Security', 'wp-secrets-manager' ),
-						'color' => 'orange',
-					),
-					'description' => sprintf(
-						'<p>%s</p>',
-						__( 'Secrets are encrypted, but using the LOGGED_IN_KEY fallback. Define a dedicated WP_SECRETS_KEY in wp-config.php for better key management.', 'wp-secrets-manager' )
-					),
-					'actions'     => '',
-					'test'        => 'wp_secrets_encryption',
-				);
-			}
-
-			return array(
-				'label'       => __( 'Secrets are encrypted', 'wp-secrets-manager' ),
+				'label'       => __( 'Secrets storage is configured', 'wp-secrets-manager' ),
 				'status'      => 'good',
 				'badge'       => array(
 					'label' => __( 'Security', 'wp-secrets-manager' ),
@@ -193,16 +130,39 @@ class WP_Secrets_Health_Check {
 				),
 				'description' => sprintf(
 					'<p>%s</p>',
-					__( 'Secrets are encrypted at rest using sodium_crypto_secretbox with a dedicated encryption key.', 'wp-secrets-manager' )
+					sprintf(
+						/* translators: %s: provider name */
+						__( 'Secrets are managed by the "%s" provider.', 'wp-secrets-manager' ),
+						$provider ? $provider->get_name() : __( 'Unknown', 'wp-secrets-manager' )
+					)
 				),
 				'actions'     => '',
 				'test'        => 'wp_secrets_encryption',
 			);
 		}
 
-		// Remote or unknown provider — assume good.
+		$key_source = $provider->get_key_source();
+
+		if ( Provider_Encrypted_Options::KEY_SOURCE_FALLBACK === $key_source ) {
+			return array(
+				'label'       => __( 'Secrets encrypted with key derived from WordPress salts', 'wp-secrets-manager' ),
+				'status'      => 'recommended',
+				'badge'       => array(
+					'label' => __( 'Security', 'wp-secrets-manager' ),
+					'color' => 'orange',
+				),
+				'description' => sprintf(
+					'<p>%s</p><p>%s</p>',
+					__( 'Secrets are encrypted at rest, but the encryption key is derived from LOGGED_IN_KEY and LOGGED_IN_SALT.', 'wp-secrets-manager' ),
+					__( 'Define a dedicated WP_SECRETS_KEY in wp-config.php for independent key management. Generate one with: wp secret generate-key', 'wp-secrets-manager' )
+				),
+				'actions'     => '',
+				'test'        => 'wp_secrets_encryption',
+			);
+		}
+
 		return array(
-			'label'       => __( 'Secrets storage is configured', 'wp-secrets-manager' ),
+			'label'       => __( 'Secrets are encrypted with a dedicated key', 'wp-secrets-manager' ),
 			'status'      => 'good',
 			'badge'       => array(
 				'label' => __( 'Security', 'wp-secrets-manager' ),
@@ -210,11 +170,7 @@ class WP_Secrets_Health_Check {
 			),
 			'description' => sprintf(
 				'<p>%s</p>',
-				sprintf(
-					/* translators: %s: provider name */
-					__( 'Secrets are managed by the "%s" provider.', 'wp-secrets-manager' ),
-					$provider ? $provider->get_name() : __( 'Unknown', 'wp-secrets-manager' )
-				)
+				__( 'Secrets are encrypted at rest using sodium_crypto_secretbox with a dedicated WP_SECRETS_KEY. The master key architecture means key rotation only re-encrypts one value.', 'wp-secrets-manager' )
 			),
 			'actions'     => '',
 			'test'        => 'wp_secrets_encryption',
@@ -245,15 +201,26 @@ class WP_Secrets_Health_Check {
 				'label' => __( 'Registered Providers', 'wp-secrets-manager' ),
 				'value' => count( $providers ),
 			),
-			'forced_provider'  => array(
-				'label' => __( 'Provider Forced', 'wp-secrets-manager' ),
-				'value' => defined( 'WP_SECRETS_PROVIDER' ) ? 'Yes (' . WP_SECRETS_PROVIDER . ')' : 'No',
-			),
 			'sodium_available' => array(
 				'label' => __( 'Sodium Available', 'wp-secrets-manager' ),
 				'value' => function_exists( 'sodium_crypto_secretbox' ) ? __( 'Yes', 'wp-secrets-manager' ) : __( 'No', 'wp-secrets-manager' ),
 			),
 		);
+
+		if ( $provider instanceof Provider_Encrypted_Options ) {
+			$fields['key_source'] = array(
+				'label' => __( 'Key Source', 'wp-secrets-manager' ),
+				'value' => $provider->get_key_source(),
+			);
+			$fields['has_previous_key'] = array(
+				'label' => __( 'Previous Key Configured', 'wp-secrets-manager' ),
+				'value' => defined( 'WP_SECRETS_KEY_PREVIOUS' ) ? __( 'Yes', 'wp-secrets-manager' ) : __( 'No', 'wp-secrets-manager' ),
+			);
+			$fields['master_key_exists'] = array(
+				'label' => __( 'Master Key Stored', 'wp-secrets-manager' ),
+				'value' => false !== get_option( Provider_Encrypted_Options::MASTER_KEY_OPTION, false ) ? __( 'Yes', 'wp-secrets-manager' ) : __( 'No (will be created on first use)', 'wp-secrets-manager' ),
+			);
+		}
 
 		if ( $provider ) {
 			$health = $provider->health_check();

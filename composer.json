@@ -1,0 +1,28 @@
+{
+	"name": "displace-foundry/wp-secrets-manager",
+	"description": "A standardized secrets management API for WordPress with automatic encryption.",
+	"type": "wordpress-plugin",
+	"license": "GPL-2.0-or-later",
+	"authors": [
+		{
+			"name": "Displace Foundry",
+			"email": "foundry@displace.tech"
+		}
+	],
+	"require": {
+		"php": ">=7.4"
+	},
+	"require-dev": {
+		"phpunit/phpunit": "^9.6",
+		"yoast/phpunit-polyfills": "^2.0"
+	},
+	"scripts": {
+		"test": "phpunit",
+		"test-group": "phpunit --group"
+	},
+	"config": {
+		"allow-plugins": {
+			"dealerdirect/phpcodesniffer-composer-installer": true
+		}
+	}
+}

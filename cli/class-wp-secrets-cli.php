@@ -150,7 +150,9 @@ class WP_Secrets_CLI extends WP_CLI_Command {
 		if ( $reveal ) {
 			WP_CLI::log( $value );
 		} else {
-			$masked = substr( $value, 0, 4 ) . str_repeat( '*', max( 0, strlen( $value ) - 4 ) );
+			$len    = strlen( $value );
+			$show   = min( 4, $len );
+			$masked = substr( $value, 0, $show ) . str_repeat( '*', max( 0, $len - $show ) );
 			WP_CLI::log( $masked );
 		}
 	}
@@ -314,8 +316,7 @@ class WP_Secrets_CLI extends WP_CLI_Command {
 	 *
 	 * ## EXAMPLES
 	 *
-	 *     wp secret migrate --from=options --to=encrypted-options
-	 *     wp secret migrate --from=encrypted-options --to=aws-kms --delete-source
+	 *     wp secret migrate --from=encrypted-options --to=aws-kms
 	 *
 	 * @param array $args       Positional arguments.
 	 * @param array $assoc_args Associative arguments.
@@ -403,11 +404,19 @@ class WP_Secrets_CLI extends WP_CLI_Command {
 	}
 
 	/**
-	 * Re-encrypt all secrets with the current key.
+	 * Re-encrypt the master key after changing WP_SECRETS_KEY.
 	 *
-	 * Useful after changing WP_SECRETS_KEY. Reads each secret with the
-	 * current (old) key and re-writes it, which encrypts with the new key
-	 * if the provider has been reconfigured.
+	 * The master key architecture means only the master key needs
+	 * re-encryption when you rotate WP_SECRETS_KEY — individual secrets
+	 * are untouched.
+	 *
+	 * Before running this command:
+	 *   1. Set WP_SECRETS_KEY_PREVIOUS to your old key value.
+	 *   2. Set WP_SECRETS_KEY to your new key value.
+	 *
+	 * The provider will automatically decrypt the master key with the
+	 * previous key and re-encrypt it with the new key on first access.
+	 * This command forces that rotation explicitly.
 	 *
 	 * ## OPTIONS
 	 *
@@ -429,49 +438,22 @@ class WP_Secrets_CLI extends WP_CLI_Command {
 			WP_CLI::error( 'No active provider.' );
 		}
 
-		$context = array( 'is_cli' => true );
-		$keys    = $provider->list_keys( '', $context );
-
-		if ( empty( $keys ) ) {
-			WP_CLI::success( 'No secrets to rotate.' );
-			return;
+		if ( ! ( $provider instanceof Provider_Encrypted_Options ) ) {
+			WP_CLI::error( 'The active provider does not support master key rotation.' );
 		}
 
-		WP_CLI::confirm(
-			sprintf( 'Re-encrypt %d secret(s) with provider "%s"?', count( $keys ), $provider->get_id() ),
-			$assoc_args
-		);
+		WP_CLI::confirm( 'Re-encrypt the master key with the current WP_SECRETS_KEY?', $assoc_args );
 
-		$success = 0;
-		$failed  = 0;
-
-		foreach ( $keys as $key ) {
-			try {
-				$value = $provider->get( $key, $context );
-				if ( null === $value ) {
-					WP_CLI::warning( sprintf( 'Could not read "%s". Skipping.', $key ) );
-					$failed++;
-					continue;
-				}
-
-				$result = $provider->set( $key, $value, $context );
-				if ( ! $result ) {
-					WP_CLI::warning( sprintf( 'Failed to re-write "%s".', $key ) );
-					$failed++;
-					continue;
-				}
-
-				$success++;
-			} catch ( WP_Secrets_Exception $e ) {
-				WP_CLI::warning( sprintf( 'Error rotating "%s": %s', $key, $e->getMessage() ) );
-				$failed++;
-			}
+		try {
+			$result = $provider->rotate_master_key();
+		} catch ( WP_Secrets_Exception $e ) {
+			WP_CLI::error( $e->getMessage() );
 		}
 
-		if ( $failed > 0 ) {
-			WP_CLI::warning( sprintf( 'Rotated %d secret(s), %d failed.', $success, $failed ) );
+		if ( $result ) {
+			WP_CLI::success( 'Master key re-encrypted. You can now remove WP_SECRETS_KEY_PREVIOUS from wp-config.php.' );
 		} else {
-			WP_CLI::success( sprintf( 'Rotated %d secret(s).', $success ) );
+			WP_CLI::warning( 'Master key rotation returned no change (the key may already be encrypted with the current secrets key).' );
 		}
 	}
 
@@ -593,7 +575,8 @@ class WP_Secrets_CLI extends WP_CLI_Command {
 
 		try {
 			$key       = random_bytes( SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
-			$key_value = 'base64:' . base64_encode( $key ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
+			// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
+			$key_value = 'base64:' . base64_encode( $key );
 		} catch ( \Exception $e ) {
 			WP_CLI::error( 'Failed to generate random key: ' . $e->getMessage() );
 		}

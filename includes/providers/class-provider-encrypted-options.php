@@ -2,15 +2,23 @@
 /**
  * Encrypted Options Provider
  *
- * Stores secrets in wp_options encrypted with sodium_crypto_secretbox
- * (XSalsa20-Poly1305). The encryption key is resolved in priority order:
+ * The sole built-in provider. Stores secrets in wp_options encrypted with
+ * sodium_crypto_secretbox (XSalsa20-Poly1305).
  *
- *   1. WP_SECRETS_KEY constant (recommended)
- *   2. WP_SECRETS_KEY environment variable
- *   3. LOGGED_IN_KEY . LOGGED_IN_SALT fallback
+ * Uses a two-tier key architecture:
  *
- * Each write generates a unique nonce prepended to the ciphertext,
- * making the stored value self-contained for decryption.
+ *   1. A "secrets key" (WP_SECRETS_KEY constant, or derived from
+ *      LOGGED_IN_KEY . LOGGED_IN_SALT) protects the master key.
+ *   2. A randomly-generated "master key" (stored encrypted in wp_options)
+ *      protects individual secrets.
+ *
+ * This means key rotation (changing WP_SECRETS_KEY) only requires
+ * re-encrypting the single master key option, not every stored secret.
+ *
+ * Supports WP_SECRETS_KEY_PREVIOUS for seamless rotation: if decryption
+ * of the master key fails with the current secrets key, the provider
+ * automatically retries with the previous key, then re-encrypts the
+ * master key under the new key.
  *
  * @package WP_Secrets_Manager
  */
@@ -25,26 +33,38 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Provider_Encrypted_Options implements WP_Secrets_Provider {
 
 	/**
-	 * Prefix applied to option names.
+	 * Prefix applied to secret option names.
 	 *
 	 * @var string
 	 */
 	const OPTION_PREFIX = '_wp_secret_';
 
 	/**
-	 * Key source constants for health reporting.
+	 * Option name where the encrypted master key is stored.
+	 *
+	 * @var string
 	 */
-	const KEY_SOURCE_CONSTANT = 'constant';
-	const KEY_SOURCE_ENV      = 'env';
-	const KEY_SOURCE_FALLBACK = 'fallback';
-	const KEY_SOURCE_NONE     = 'none';
+	const MASTER_KEY_OPTION = '_wp_secrets_master_key';
 
 	/**
-	 * Cached derived encryption key.
+	 * Key source identifiers for health reporting.
+	 */
+	const KEY_SOURCE_CONSTANT = 'constant';
+	const KEY_SOURCE_FALLBACK = 'fallback';
+
+	/**
+	 * Cached derived secrets key (the key that encrypts the master key).
 	 *
 	 * @var string|null
 	 */
-	private $key_cache = null;
+	private $secrets_key_cache = null;
+
+	/**
+	 * Cached plaintext master key (the key that encrypts individual secrets).
+	 *
+	 * @var string|null
+	 */
+	private $master_key_cache = null;
 
 	/**
 	 * Cached key source identifier.
@@ -75,16 +95,13 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 	}
 
 	/**
-	 * Available when the sodium extension is loaded and a key can be derived.
+	 * Available when sodium is loaded. A key is always derivable because
+	 * WordPress requires LOGGED_IN_KEY and LOGGED_IN_SALT.
 	 *
 	 * {@inheritDoc}
 	 */
 	public function is_available(): bool {
-		if ( ! function_exists( 'sodium_crypto_secretbox' ) ) {
-			return false;
-		}
-
-		return self::KEY_SOURCE_NONE !== $this->get_key_source();
+		return function_exists( 'sodium_crypto_secretbox' );
 	}
 
 	/**
@@ -98,7 +115,9 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 			return null;
 		}
 
-		return $this->decrypt( $raw, $key );
+		$master_key = $this->get_master_key();
+
+		return $this->decrypt( $raw, $master_key, $key );
 	}
 
 	/**
@@ -106,7 +125,8 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 	 */
 	public function set( string $key, string $value, array $context = [] ): bool {
 		$option_name = self::option_name( $key );
-		$encrypted   = $this->encrypt( $value, $key );
+		$master_key  = $this->get_master_key();
+		$encrypted   = $this->encrypt( $value, $master_key, $key );
 
 		if ( false === get_option( $option_name ) ) {
 			return add_option( $option_name, $encrypted, '', 'no' );
@@ -140,8 +160,9 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$results = $wpdb->get_col(
 			$wpdb->prepare(
-				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s ORDER BY option_name ASC",
-				$like
+				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name != %s ORDER BY option_name ASC",
+				$like,
+				self::MASTER_KEY_OPTION
 			)
 		);
 
@@ -159,25 +180,26 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 	 * {@inheritDoc}
 	 */
 	public function health_check(): array {
-		$source = $this->get_key_source();
-
-		if ( self::KEY_SOURCE_NONE === $source ) {
+		if ( ! function_exists( 'sodium_crypto_secretbox' ) ) {
 			return array(
 				'status'  => 'critical',
-				'message' => __( 'No encryption key available. Define WP_SECRETS_KEY in wp-config.php.', 'wp-secrets-manager' ),
+				'message' => __( 'The sodium PHP extension is not available. Secrets cannot be encrypted.', 'wp-secrets-manager' ),
 			);
 		}
 
-		// Verify round-trip.
+		$source = $this->get_key_source();
+
+		// Verify master key round-trip.
 		try {
+			$master_key     = $this->get_master_key();
 			$test_plaintext = 'wp-secrets-health-check-' . wp_generate_password( 12, false );
-			$ciphertext     = $this->encrypt( $test_plaintext, '__health_check__' );
-			$decrypted      = $this->decrypt( $ciphertext, '__health_check__' );
+			$ciphertext     = $this->encrypt( $test_plaintext, $master_key, '__health_check__' );
+			$decrypted      = $this->decrypt( $ciphertext, $master_key, '__health_check__' );
 
 			if ( $test_plaintext !== $decrypted ) {
 				return array(
 					'status'  => 'critical',
-					'message' => __( 'Encryption round-trip failed. The encryption key may be corrupted.', 'wp-secrets-manager' ),
+					'message' => __( 'Encryption round-trip failed. The master key or secrets key may be corrupted.', 'wp-secrets-manager' ),
 				);
 			}
 		} catch ( WP_Secrets_Exception $e ) {
@@ -190,32 +212,165 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 		if ( self::KEY_SOURCE_FALLBACK === $source ) {
 			return array(
 				'status'  => 'recommended',
-				'message' => __( 'Encryption active using fallback key (LOGGED_IN_KEY). Define a dedicated WP_SECRETS_KEY in wp-config.php for better security.', 'wp-secrets-manager' ),
+				'message' => __( 'Encryption active using key derived from WordPress salts. Define a dedicated WP_SECRETS_KEY in wp-config.php for independent key management.', 'wp-secrets-manager' ),
 			);
 		}
 
 		return array(
 			'status'  => 'good',
-			'message' => sprintf(
-				/* translators: %s: key source (constant or env) */
-				__( 'Encryption active with dedicated key (source: %s).', 'wp-secrets-manager' ),
-				$source
-			),
+			'message' => __( 'Encryption active with dedicated WP_SECRETS_KEY.', 'wp-secrets-manager' ),
 		);
+	}
+
+	/**
+	 * Get the key source for external reporting.
+	 *
+	 * @return string One of the KEY_SOURCE_* constants.
+	 */
+	public function get_key_source(): string {
+		if ( null !== $this->key_source_cache ) {
+			return $this->key_source_cache;
+		}
+
+		if ( defined( 'WP_SECRETS_KEY' ) && '' !== WP_SECRETS_KEY ) {
+			$this->key_source_cache = self::KEY_SOURCE_CONSTANT;
+		} else {
+			$this->key_source_cache = self::KEY_SOURCE_FALLBACK;
+		}
+
+		return $this->key_source_cache;
+	}
+
+	/**
+	 * Get or create the plaintext master key.
+	 *
+	 * The master key is generated once and stored encrypted in wp_options.
+	 * It is decrypted on each request using the secrets key.
+	 *
+	 * @return string 32-byte binary master key.
+	 *
+	 * @throws WP_Secrets_Exception If the master key cannot be decrypted or created.
+	 */
+	private function get_master_key(): string {
+		if ( null !== $this->master_key_cache ) {
+			return $this->master_key_cache;
+		}
+
+		$stored = get_option( self::MASTER_KEY_OPTION, false );
+
+		if ( false !== $stored && '' !== $stored ) {
+			$this->master_key_cache = $this->decrypt_master_key( $stored );
+			return $this->master_key_cache;
+		}
+
+		// First run: generate and store a new master key.
+		$master_key             = random_bytes( SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
+		$this->master_key_cache = $master_key;
+
+		$secrets_key       = $this->derive_secrets_key();
+		$encrypted_master  = $this->encrypt( $master_key, $secrets_key, '__master_key__' );
+
+		add_option( self::MASTER_KEY_OPTION, $encrypted_master, '', 'no' );
+
+		return $this->master_key_cache;
+	}
+
+	/**
+	 * Decrypt the stored master key.
+	 *
+	 * Tries the current secrets key first. If that fails and
+	 * WP_SECRETS_KEY_PREVIOUS is defined, retries with the previous key
+	 * and re-encrypts the master key under the current key (transparent
+	 * rotation).
+	 *
+	 * @param string $stored The encrypted master key from wp_options.
+	 * @return string 32-byte binary master key.
+	 *
+	 * @throws WP_Secrets_Exception If decryption fails with all available keys.
+	 */
+	private function decrypt_master_key( string $stored ): string {
+		$secrets_key = $this->derive_secrets_key();
+
+		try {
+			return $this->decrypt( $stored, $secrets_key, '__master_key__' );
+		} catch ( WP_Secrets_Exception $e ) {
+			// Fall through to try previous key.
+		}
+
+		// Try the previous key for rotation support.
+		if ( defined( 'WP_SECRETS_KEY_PREVIOUS' ) && '' !== WP_SECRETS_KEY_PREVIOUS ) {
+			$previous_key = $this->derive_key_from_material( WP_SECRETS_KEY_PREVIOUS );
+
+			try {
+				$master_key = $this->decrypt( $stored, $previous_key, '__master_key__' );
+			} catch ( WP_Secrets_Exception $e ) {
+				throw new WP_Secrets_Exception(
+					__( 'Cannot decrypt master key with current or previous secrets key. Secrets are inaccessible.', 'wp-secrets-manager' ),
+					0,
+					$e,
+					'__master_key__',
+					$this->get_id()
+				);
+			}
+
+			// Re-encrypt master key under the new secrets key.
+			$re_encrypted = $this->encrypt( $master_key, $secrets_key, '__master_key__' );
+			update_option( self::MASTER_KEY_OPTION, $re_encrypted, 'no' );
+
+			/**
+			 * Fires when the master key is re-encrypted after a key rotation.
+			 *
+			 * @param string $key_source The new key source.
+			 */
+			do_action( 'wp_secrets_master_key_rotated', $this->get_key_source() );
+
+			return $master_key;
+		}
+
+		throw new WP_Secrets_Exception(
+			__( 'Cannot decrypt master key. If you recently changed WP_SECRETS_KEY, set WP_SECRETS_KEY_PREVIOUS to the old value.', 'wp-secrets-manager' ),
+			0,
+			null,
+			'__master_key__',
+			$this->get_id()
+		);
+	}
+
+	/**
+	 * Re-encrypt the master key with the current secrets key.
+	 *
+	 * Called by the `wp secret rotate` CLI command after a key change.
+	 *
+	 * @return bool True on success.
+	 *
+	 * @throws WP_Secrets_Exception If rotation fails.
+	 */
+	public function rotate_master_key(): bool {
+		$master_key   = $this->get_master_key();
+		$secrets_key  = $this->derive_secrets_key();
+		$re_encrypted = $this->encrypt( $master_key, $secrets_key, '__master_key__' );
+
+		$result = update_option( self::MASTER_KEY_OPTION, $re_encrypted, 'no' );
+
+		if ( $result ) {
+			/** This action is documented in decrypt_master_key(). */
+			do_action( 'wp_secrets_master_key_rotated', $this->get_key_source() );
+		}
+
+		return $result;
 	}
 
 	/**
 	 * Encrypt a plaintext value.
 	 *
-	 * @param string $plaintext The value to encrypt.
-	 * @param string $key       The secret key name (for error context only).
+	 * @param string $plaintext      The value to encrypt.
+	 * @param string $encryption_key The 32-byte encryption key.
+	 * @param string $context_key    The secret key name (for error context only).
 	 * @return string Base64-encoded nonce + ciphertext.
 	 *
 	 * @throws WP_Secrets_Exception If encryption fails.
 	 */
-	private function encrypt( string $plaintext, string $key ): string {
-		$encryption_key = $this->derive_key();
-
+	private function encrypt( string $plaintext, string $encryption_key, string $context_key ): string {
 		try {
 			$nonce      = random_bytes( SODIUM_CRYPTO_SECRETBOX_NONCEBYTES );
 			$ciphertext = sodium_crypto_secretbox( $plaintext, $nonce, $encryption_key );
@@ -224,43 +379,45 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 				__( 'Encryption failed.', 'wp-secrets-manager' ),
 				0,
 				$e,
-				$key,
+				$context_key,
 				$this->get_id()
 			);
 		}
 
-		return base64_encode( $nonce . $ciphertext ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
+		return base64_encode( $nonce . $ciphertext );
 	}
 
 	/**
 	 * Decrypt a stored value.
 	 *
-	 * @param string $stored The base64-encoded nonce + ciphertext.
-	 * @param string $key    The secret key name (for error context only).
+	 * @param string $stored         The base64-encoded nonce + ciphertext.
+	 * @param string $encryption_key The 32-byte encryption key.
+	 * @param string $context_key    The secret key name (for error context only).
 	 * @return string The decrypted plaintext.
 	 *
 	 * @throws WP_Secrets_Exception If decryption fails.
 	 */
-	private function decrypt( string $stored, string $key ): string {
-		$encryption_key = $this->derive_key();
-
-		$decoded = base64_decode( $stored, true ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode
+	private function decrypt( string $stored, string $encryption_key, string $context_key ): string {
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode
+		$decoded = base64_decode( $stored, true );
 		if ( false === $decoded ) {
 			throw new WP_Secrets_Exception(
 				__( 'Invalid stored ciphertext (base64 decode failed).', 'wp-secrets-manager' ),
 				0,
 				null,
-				$key,
+				$context_key,
 				$this->get_id()
 			);
 		}
 
-		if ( strlen( $decoded ) < SODIUM_CRYPTO_SECRETBOX_NONCEBYTES + SODIUM_CRYPTO_SECRETBOX_MACBYTES ) {
+		$min_length = SODIUM_CRYPTO_SECRETBOX_NONCEBYTES + SODIUM_CRYPTO_SECRETBOX_MACBYTES;
+		if ( strlen( $decoded ) < $min_length ) {
 			throw new WP_Secrets_Exception(
 				__( 'Stored ciphertext is too short to contain a valid nonce and payload.', 'wp-secrets-manager' ),
 				0,
 				null,
-				$key,
+				$context_key,
 				$this->get_id()
 			);
 		}
@@ -272,20 +429,20 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 			$plaintext = sodium_crypto_secretbox_open( $ciphertext, $nonce, $encryption_key );
 		} catch ( \SodiumException $e ) {
 			throw new WP_Secrets_Exception(
-				__( 'Decryption failed. The encryption key may have changed.', 'wp-secrets-manager' ),
+				__( 'Decryption failed.', 'wp-secrets-manager' ),
 				0,
 				$e,
-				$key,
+				$context_key,
 				$this->get_id()
 			);
 		}
 
 		if ( false === $plaintext ) {
 			throw new WP_Secrets_Exception(
-				__( 'Decryption failed. The encryption key may have changed or the data is corrupt.', 'wp-secrets-manager' ),
+				__( 'Decryption failed. The key may have changed or the data is corrupt.', 'wp-secrets-manager' ),
 				0,
 				null,
-				$key,
+				$context_key,
 				$this->get_id()
 			);
 		}
@@ -294,101 +451,68 @@ class Provider_Encrypted_Options implements WP_Secrets_Provider {
 	}
 
 	/**
-	 * Derive the 32-byte encryption key from the best available source.
+	 * Derive the 32-byte secrets key (the key that protects the master key).
+	 *
+	 * Sources, in order:
+	 *   1. WP_SECRETS_KEY constant (recommended)
+	 *   2. LOGGED_IN_KEY . LOGGED_IN_SALT (always available)
 	 *
 	 * @return string 32-byte binary key.
-	 *
-	 * @throws WP_Secrets_Exception If no key source is available.
 	 */
-	private function derive_key(): string {
-		if ( null !== $this->key_cache ) {
-			return $this->key_cache;
-		}
-
-		$source = $this->get_key_source();
-
-		if ( self::KEY_SOURCE_NONE === $source ) {
-			throw new WP_Secrets_Exception(
-				__( 'No encryption key available. Define WP_SECRETS_KEY in wp-config.php or as an environment variable.', 'wp-secrets-manager' ),
-				0,
-				null,
-				'',
-				$this->get_id()
-			);
-		}
-
-		$raw_key = $this->get_raw_key_material( $source );
-
-		// If the key starts with 'base64:', decode it directly.
-		if ( 0 === strpos( $raw_key, 'base64:' ) ) {
-			$decoded = base64_decode( substr( $raw_key, 7 ), true ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode
-			if ( false !== $decoded && SODIUM_CRYPTO_SECRETBOX_KEYBYTES === strlen( $decoded ) ) {
-				$this->key_cache = $decoded;
-				return $this->key_cache;
-			}
-		}
-
-		// Derive a fixed-length key via BLAKE2b hash.
-		$this->key_cache = sodium_crypto_generichash( $raw_key, '', SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
-
-		return $this->key_cache;
-	}
-
-	/**
-	 * Determine the key source without resolving the key itself.
-	 *
-	 * @return string One of the KEY_SOURCE_* constants.
-	 */
-	public function get_key_source(): string {
-		if ( null !== $this->key_source_cache ) {
-			return $this->key_source_cache;
+	private function derive_secrets_key(): string {
+		if ( null !== $this->secrets_key_cache ) {
+			return $this->secrets_key_cache;
 		}
 
 		if ( defined( 'WP_SECRETS_KEY' ) && '' !== WP_SECRETS_KEY ) {
-			$this->key_source_cache = self::KEY_SOURCE_CONSTANT;
-		} elseif ( false !== getenv( 'WP_SECRETS_KEY' ) && '' !== getenv( 'WP_SECRETS_KEY' ) ) {
-			$this->key_source_cache = self::KEY_SOURCE_ENV;
-		} elseif ( defined( 'LOGGED_IN_KEY' ) && defined( 'LOGGED_IN_SALT' ) && '' !== LOGGED_IN_KEY && '' !== LOGGED_IN_SALT ) {
-			$this->key_source_cache = self::KEY_SOURCE_FALLBACK;
+			$this->secrets_key_cache = $this->derive_key_from_material( WP_SECRETS_KEY );
 		} else {
-			$this->key_source_cache = self::KEY_SOURCE_NONE;
+			$this->secrets_key_cache = $this->derive_key_from_material( LOGGED_IN_KEY . LOGGED_IN_SALT );
 		}
 
-		return $this->key_source_cache;
+		return $this->secrets_key_cache;
 	}
 
 	/**
-	 * Retrieve the raw key material for a given source.
+	 * Derive a 32-byte key from arbitrary key material.
 	 *
-	 * @param string $source One of the KEY_SOURCE_* constants.
-	 * @return string Raw key material.
+	 * If the material is a base64:-prefixed string of exactly the right
+	 * length, it is used directly. Otherwise, BLAKE2b hashes it to the
+	 * correct length.
+	 *
+	 * @param string $material Raw key material.
+	 * @return string 32-byte binary key.
 	 */
-	private function get_raw_key_material( string $source ): string {
-		switch ( $source ) {
-			case self::KEY_SOURCE_CONSTANT:
-				return WP_SECRETS_KEY;
-
-			case self::KEY_SOURCE_ENV:
-				return getenv( 'WP_SECRETS_KEY' );
-
-			case self::KEY_SOURCE_FALLBACK:
-				return LOGGED_IN_KEY . LOGGED_IN_SALT;
-
-			default:
-				return '';
+	private function derive_key_from_material( string $material ): string {
+		if ( 0 === strpos( $material, 'base64:' ) ) {
+			// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode
+			$decoded = base64_decode( substr( $material, 7 ), true );
+			if ( false !== $decoded && SODIUM_CRYPTO_SECRETBOX_KEYBYTES === strlen( $decoded ) ) {
+				return $decoded;
+			}
 		}
+
+		return sodium_crypto_generichash( $material, '', SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
 	}
 
 	/**
 	 * Build the wp_options option_name for a given secret key.
 	 *
-	 * Uses the same prefix as the plaintext provider so migrations
-	 * between the two only require re-encrypting values in place.
-	 *
 	 * @param string $key The secret key.
 	 * @return string
 	 */
 	public static function option_name( string $key ): string {
-		return self::OPTION_PREFIX . str_replace( '/', '_', $key );
+		return self::OPTION_PREFIX . $key;
+	}
+
+	/**
+	 * Reset cached keys (for testing only).
+	 *
+	 * @return void
+	 */
+	public function reset_cache(): void {
+		$this->secrets_key_cache = null;
+		$this->master_key_cache  = null;
+		$this->key_source_cache  = null;
 	}
 }
